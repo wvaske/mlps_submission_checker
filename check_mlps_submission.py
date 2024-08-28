@@ -4,6 +4,7 @@
 #
 # 28-Aug-2024  Wes Vaske
 
+import argparse
 import json
 import os
 import sys
@@ -18,18 +19,56 @@ gpus = ['a100', 'h100']
 CACHE_PERCENT_THRESHOLD = 0.2
 
 
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="Script to check for specific issues in MLPerf Storage v1.0 submissions"
+    )
+    parser.add_argument('-r', '--root-path', required=True, type=str,
+                        help="The root path of the submission directory. Top level directories in this path are "
+                             "assumed to be the submitters")
+    parser.add_argument('-s', '--filter-submitters', nargs="+", default=[],
+                        help="Space separated list of submitters to check")
+    parser.add_argument('-a', '--check-all', action="store_true",
+                        help="Perform all checks")
+    parser.add_argument('--reports-only', action="store_true",
+                        help="Print only the reports with issues, not the details of the issues.")
+    parser.add_argument('-v', '--verbose', action="store_true",
+                        help="List details of non-issue reports as well as issue reports")
+    parser.add_argument('--check-inter-test-times', action="store_true",
+                        help="Analyze the time between runs for possible non-consecutive tests.")
+    parser.add_argument('--check-file-system-caching', action="store_true",
+                        help="Analyze the cache percentages to detect possible issues.")
+
+    return {k: v for k, v in vars(parser.parse_args()).items()}
+
+
 class MLPerfStorageResults:
 
-    def __init__(self, storage_root_dir=None):
+    def __init__(self, root_path=None, verbose=False, check_all=False, reports_only=False, filter_submitters=None,
+                 *args, **kwargs):
 
         # Parameters need tob e set for check_init to work
-        self.storage_root_dir = storage_root_dir
-        self.check_init()
+        self.root_path = root_path
+        self.verbose = verbose
+        self.check_all = check_all
+        self.reports_only = reports_only
+
+        self.checks = {k: v for k, v in kwargs.items() if k.startswith("check_")}
+        for key in self.checks.keys():
+            if key.startswith('check_'):
+                kwargs.pop(key)
+
+        self._kwargs = kwargs
+        self.validate_init()
 
         # Logic after knowing that init inputs are valid
-        self.submitters = os.listdir(storage_root_dir)
+        self.submitters = os.listdir(root_path)
         non_submitter_dirs = ["CONTRIBUTING.md", ".github", "README.md", "LICENSE.md"]
         self.submitters = [s for s in self.submitters if s not in non_submitter_dirs]
+
+        if filter_submitters:
+            filter_submitters = [s.lower() for s in filter_submitters]
+            self.submitters = [s for s in self.submitters if s.lower() in filter_submitters]
 
         # The individual dicts hold "report_path":["list of summary.json paths"]
         self.submitter_report_summary_map = {submitter: dict() for submitter in self.submitters}
@@ -38,22 +77,28 @@ class MLPerfStorageResults:
         self.submitter_issues = {submitter: dict() for submitter in self.submitters}
 
         self.generate_run_mapping()
+        self.run_checks()
+        self.print_report()
 
-    def check_init(self):
+    def validate_init(self):
         messages = []
-        if self.storage_root_dir is None:
-            messages.append(f'Storage root directory is not provided. '
+        if self.root_path is None:
+            messages.append(f'Root directory is not provided. '
                             f'Please provide the root directory of an MLPerf Storage Submission')
+
+        if self._kwargs:
+            for key, value in self._kwargs.items():
+                messages.append(f'Unused input kwargs: {key}:{value}')
 
         if messages:
             for message in messages:
-                print("ERROR - {message}")
+                print(f"ERROR - {message}")
             print('Failed to initialize MLPerfStorageResults object')
             raise Exception("Configuration Error")
 
     def generate_run_mapping(self):
         for submitter in self.submitters:
-            submitter_dir = os.path.join(self.storage_root_dir, submitter)
+            submitter_dir = os.path.join(self.root_path, submitter)
             if not os.path.isdir(submitter_dir):
                 print(f'WARNING - Submitter directory {submitter_dir} does not exist')
                 continue
@@ -68,13 +113,29 @@ class MLPerfStorageResults:
                 report_summaries = [f for f in submitter_summaries if f.startswith(report_base_path)]
                 self.submitter_report_summary_map[submitter][report] = report_summaries
 
-    def check_time_between_runs(self):
+    def run_checks(self):
+        for check, enabled in self.checks.items():
+            if (self.check_all or enabled) and hasattr(self, check):
+                getattr(self, check)()
+
+    def check_inter_test_times(self):
+        NON_ISSUE = "NON-ISSUE: time_between_runs"
+        TIME_BETWEEN_RUNS_ISSUE = "ISSUE (possible): time_between_runs"
+
         for submitter in self.submitters:
-            submitter_flagged = False
             submitter_run_mapping = self.submitter_report_summary_map[submitter]
             for report, summaries in submitter_run_mapping.items():
                 times = list()
                 AUs = list()
+
+                if len(summaries) != 5:
+                    # This occurs when we get the test files from the code dir. A proper mlperf_storage_report.json
+                    #   can only be created with 5 runs and anything else will not generate the report so we are safe
+                    #   to do a quick check like this and pop on out
+                    if self.verbose:
+                        print(f'Skipping report from {submitter} due to not having 5 summary files: {report}')
+                    continue
+
                 for summary in sorted(summaries):
                     with open(summary) as open_summary:
                         sum_data = json.load(open_summary)
@@ -89,21 +150,32 @@ class MLPerfStorageResults:
                 for i in range(len(times) - 1):
                     deltas.append((times[i + 1][0] - times[i][1]).seconds)
 
-                if any(delta > mean_run_time for delta in deltas):
-                    issue_details = {report:
-                                         {"deltas": ", ".join([f"{delta}" for delta in deltas]),
-                                          "run_times": ", ".join([f"{rt}" for rt in run_times]),
-                                          "aus": ", ".join([f"{au}%" for au in AUs]),
-                                          "au_std": round(stdev(AUs), 4)
-                                          }
-                                     }
+                if len(AUs) == 1:
+                    import pdb
+                    pdb.set_trace()
+                issue_details = {report:
+                                     {"deltas": ", ".join([f"{delta}" for delta in deltas]),
+                                      "run_times": ", ".join([f"{rt}" for rt in run_times]),
+                                      "aus": ", ".join([f"{au}%" for au in AUs]),
+                                      "au_std": round(stdev(AUs), 4)
+                                      }
+                                 }
 
-                    if not submitter_flagged:
-                        self.submitter_issues[submitter] = {"time_between_runs": dict()}
-                        submitter_flagged = True
-                    self.submitter_issues[submitter]["time_between_runs"].update(issue_details)
+                if any(delta > mean_run_time for delta in deltas):
+                    if TIME_BETWEEN_RUNS_ISSUE not in self.submitter_issues[submitter].keys():
+                        self.submitter_issues[submitter][TIME_BETWEEN_RUNS_ISSUE] = dict()
+                    self.submitter_issues[submitter][TIME_BETWEEN_RUNS_ISSUE].update(issue_details)
+
+                elif self.verbose:
+                    if NON_ISSUE not in self.submitter_issues[submitter].keys():
+                        self.submitter_issues[submitter][NON_ISSUE] = dict()
+                    self.submitter_issues[submitter][NON_ISSUE].update(issue_details)
 
     def check_file_system_caching(self):
+        NON_ISSUE = 'NON-ISSUE: cached_runs'
+        SINGLE_CACHED_RUN_ISSUE = "ISSUE (possible): single_cached_run"
+        MULTIPLE_CACHED_RUNS_ISSUE = "ISSUE: multiple_cached_runs"
+
         for submitter in self.submitters:
             submitter_flagged = False
             submitter_run_mapping = self.submitter_report_summary_map[submitter]
@@ -136,9 +208,6 @@ class MLPerfStorageResults:
                 cached_percent = [round((active_file[i] + inactive_file[i]) / mem_total[i], 4) for i in range(len(mem_total))]
                 cached_runs = [cp for cp in cached_percent if cp > CACHE_PERCENT_THRESHOLD]
 
-                if len(cached_runs) == 0:
-                    continue
-
                 issue_details = {
                         report: {
                             "cached_percents": ", ".join([f"{round(cp*100, 2)}%" for cp in cached_percent]),
@@ -148,30 +217,29 @@ class MLPerfStorageResults:
                         }
                     }
 
-                if len(cached_runs) > 0 and not submitter_flagged:
-                    submitter_flagged = True
-                    self.submitter_issues[submitter] = dict()
+                if not cached_runs and self.verbose:
+                    if NON_ISSUE not in self.submitter_issues[submitter].keys():
+                        self.submitter_issues[submitter][NON_ISSUE] = dict()
+                    self.submitter_issues[submitter][NON_ISSUE].update(issue_details)
 
                 if len(cached_runs) == 1:
-                    if "single_cached_run" not in self.submitter_issues[submitter].keys():
-                        self.submitter_issues[submitter]["single_cached_run"] = dict()
-
-                    self.submitter_issues[submitter]["single_cached_run"].update(issue_details)
+                    if SINGLE_CACHED_RUN_ISSUE not in self.submitter_issues[submitter].keys():
+                        self.submitter_issues[submitter][SINGLE_CACHED_RUN_ISSUE] = dict()
+                    self.submitter_issues[submitter][SINGLE_CACHED_RUN_ISSUE].update(issue_details)
 
                 if len(cached_runs) > 1:
-                    if "multiple_cached_runs" not in self.submitter_issues[submitter].keys():
-                        self.submitter_issues[submitter]["multiple_cached_runs"] = dict()
+                    if MULTIPLE_CACHED_RUNS_ISSUE not in self.submitter_issues[submitter].keys():
+                        self.submitter_issues[submitter][MULTIPLE_CACHED_RUNS_ISSUE] = dict()
+                    self.submitter_issues[submitter][MULTIPLE_CACHED_RUNS_ISSUE].update(issue_details)
 
-                    self.submitter_issues[submitter]["multiple_cached_runs"].update(issue_details)
-
-    def print_report(self, print_detail=False):
+    def print_report(self):
         for submitter, issues in self.submitter_issues.items():
             print(f'\nSubmitter: {submitter}')
             for issue_type, details in issues.items():
-                print(f'  Issue Type: {issue_type}')
+                print(f'  {issue_type}')
                 for report, issue_detail in details.items():
                     print(f'    Report: {os.path.dirname(report)}')
-                    if print_detail:
+                    if not self.reports_only:
                         print(f'      Details:')
                         for key, value in issue_detail.items():
                             print(f'        {key}: {value}')
@@ -186,14 +254,6 @@ def get_file_list(top_directory="."):
     return file_list
 
 
-def main(dir_to_walk):
-    mlperf_storage_results = MLPerfStorageResults(storage_root_dir=dir_to_walk)
-    mlperf_storage_results.check_time_between_runs()
-    mlperf_storage_results.check_file_system_caching()
-
-    mlperf_storage_results.print_report(print_detail=True)
-
-
 if __name__ == "__main__":
-    root_path = "." if len(sys.argv) == 1 else sys.argv[1]
-    main(root_path)
+    input_kwargs = parse_arguments()
+    mlperf_storage_results = MLPerfStorageResults(**input_kwargs)
