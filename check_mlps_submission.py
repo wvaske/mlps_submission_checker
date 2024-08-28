@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
+#
+# Copyright (C) 2024 Micron Technology, Inc. All rights reserved
+#
+# 28-Aug-2024  Wes Vaske
 
 import json
 import os
 import sys
-import pprint
 
 from datetime import datetime
 from statistics import mean, stdev
@@ -13,24 +16,6 @@ workloads = ["unet", "resnet", "cosmoflow"]
 gpus = ['a100', 'h100']
 
 CACHE_PERCENT_THRESHOLD = 0.2
-
-"""
-Generate data structure like:
-submitter1:
-  cosmoflow, h100:
-    summaries: []
-    report: filename
-submitter2:
-  cosmoflow, h100:
-    summaries: []
-    report: filename
-  resnet50, a100:
-    summaries: []
-    report: filename
-  resnet50, h100:
-    summaries: []
-    report: filename
-"""
 
 
 class MLPerfStorageResults:
@@ -210,4 +195,5 @@ def main(dir_to_walk):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    root_path = "." if len(sys.argv) == 1 else sys.argv[1]
+    main(root_path)
