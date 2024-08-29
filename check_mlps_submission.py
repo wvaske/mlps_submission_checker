@@ -84,6 +84,7 @@ class MLPerfStorageResults:
 
         # Logic after knowing that init inputs are valid
         self.submitters = os.listdir(root_path)
+        print(f'Processing {len(self.submitters)} submitters...')
         non_submitter_dirs = ["CONTRIBUTING.md", ".github", "README.md", "LICENSE.md"]
         self.submitters = [s for s in self.submitters if s not in non_submitter_dirs]
 
@@ -119,6 +120,8 @@ class MLPerfStorageResults:
             raise Exception("Configuration Error")
 
     def generate_run_mapping(self):
+        num_summaries = 0
+        num_reports = 0
         for submitter in self.submitters:
             submitter_dir = os.path.join(self.root_path, submitter)
             if not os.path.isdir(submitter_dir):
@@ -129,12 +132,16 @@ class MLPerfStorageResults:
             submitter_summaries = [f for f in submitter_file_list if os.path.basename(f) == "summary.json" if "code" not in f]
             submitter_reports = [f for f in submitter_file_list if os.path.basename(f) == "mlperf_storage_report.json" if "code" not in f]
             self.submitter_file_list[submitter] = submitter_file_list
+            num_summaries += len(submitter_summaries)
+            num_reports += len(submitter_reports)
 
             # For a given report, there should be a number of summary.json files that correspond with the same base path
             for report in submitter_reports:
                 report_base_path = os.path.dirname(report)
                 report_summaries = [f for f in submitter_summaries if f.startswith(report_base_path)]
                 self.submitter_report_summary_map[submitter][report] = report_summaries
+
+        print(f'Processing {num_reports} Reports and {num_summaries} Summaries')
 
     def add_issue_details(self, submitter, issue_key, issue_details, report=None):
         if issue_key not in self.submitter_issues[submitter].keys():
@@ -218,11 +225,11 @@ class MLPerfStorageResults:
                     summary_report_map[sf] = None
 
             issue_details = {"all_reports_generated": {
-                "summaries_with_no_report": f"\n{31*' '}".join([sf for sf, report in summary_report_map.items() if report is None])
+                "summaries_with_no_report": f"\n{35*' '}".join([sf for sf, report in summary_report_map.items() if report is None])
             }}
 
             non_issue_details = {"all_reports_generated": {
-                "summaries_with_reports": f"\n{34*' '}".join([sf for sf, report in summary_report_map.items() if report])
+                "summaries_with_reports": f"\n{32*' '}".join([sf for sf, report in summary_report_map.items() if report])
             }}
 
             if non_issue_details["all_reports_generated"]["summaries_with_reports"] and self.verbose:
@@ -298,7 +305,7 @@ class MLPerfStorageResults:
                                            issue_details=issue_details)
 
     def check_checkpoint_files_in_code(self):
-        NON_ISSUE = "NON-ISSUE: checkpoint_files_in_code"
+        NON_ISSUE = "NON-ISSUE: checkpoint_files_not_in_code"
         CHECKPOINT_FILES_IN_CODE_ISSUE = "ISSUE: checkpoint_file_in_code"
 
         for submitter in self.submitters:
@@ -350,8 +357,8 @@ class MLPerfStorageResults:
                                            issue_details=issue_details)
 
     def check_inter_test_times(self):
-        NON_ISSUE = "NON-ISSUE: time_between_runs"
-        TIME_BETWEEN_RUNS_ISSUE = "ISSUE (possible): time_between_runs"
+        NON_ISSUE = "NON-ISSUE: minimal_time_between_runs"
+        TIME_BETWEEN_RUNS_ISSUE = "ISSUE (possible): time_between_runs_exceeds_avg_runtime"
 
         for submitter in self.submitters:
             submitter_run_mapping = self.submitter_report_summary_map[submitter]
@@ -400,7 +407,7 @@ class MLPerfStorageResults:
                     self.submitter_issues[submitter][NON_ISSUE].update(issue_details)
 
     def check_file_system_caching(self):
-        NON_ISSUE = 'NON-ISSUE: cached_runs'
+        NON_ISSUE = 'NON-ISSUE: no_cached_runs'
         SINGLE_CACHED_RUN_ISSUE = "ISSUE (possible): single_cached_run"
         MULTIPLE_CACHED_RUNS_ISSUE = "ISSUE: multiple_cached_runs"
 
