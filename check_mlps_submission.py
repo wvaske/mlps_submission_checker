@@ -97,7 +97,7 @@ class MLPerfStorageResults:
         # The dicts hold <issue_type>: {<report path>:<detail_dict>}
         self.submitter_issues = {submitter: dict() for submitter in self.submitters}
 
-        self.submitter_file_list = []
+        self.submitter_file_list = dict()
         self.generate_run_mapping()
         self.run_checks()
         self.print_report()
@@ -126,9 +126,9 @@ class MLPerfStorageResults:
                 continue
 
             submitter_file_list = get_file_list(submitter_dir)
-            submitter_summaries = [f for f in submitter_file_list if os.path.basename(f) == "summary.json"]
-            submitter_reports = [f for f in submitter_file_list if os.path.basename(f) == "mlperf_storage_report.json"]
-            self.submitter_file_list = submitter_file_list
+            submitter_summaries = [f for f in submitter_file_list if os.path.basename(f) == "summary.json" if "code" not in f]
+            submitter_reports = [f for f in submitter_file_list if os.path.basename(f) == "mlperf_storage_report.json" if "code" not in f]
+            self.submitter_file_list[submitter] = submitter_file_list
 
             # For a given report, there should be a number of summary.json files that correspond with the same base path
             for report in submitter_reports:
@@ -149,7 +149,8 @@ class MLPerfStorageResults:
         elif not report:
             self.submitter_issues[submitter][issue_key].update(issue_details)
 
-    def get_summary_config_dict(self, summary):
+    @staticmethod
+    def get_summary_config_dict(summary):
         # We are looking for a config.yaml and overrides.yaml that have the same basepath as the summary.json
         base_dir = os.path.dirname(summary)
         config_yaml = os.path.join(base_dir, "configs", "config.yaml")
@@ -186,7 +187,53 @@ class MLPerfStorageResults:
         # Whereever there is a summary file, there should be a report 1 level up
         # We'll generate a flat list of the reports and summaries
         # Then verify that summaries are matched to ../report
-        pass
+        for submitter in self.submitters:
+            summary_files = [f for f in self.submitter_file_list[submitter]
+                             if os.path.basename(f) == "summary.json"]
+
+            summary_report_map = dict()
+            for sf in summary_files:
+                if "code" in sf:
+                    continue
+
+                sf_dir = os.path.dirname(sf)
+                report_dir = os.path.dirname(sf_dir)
+
+                report_dir_files = os.listdir(report_dir)
+                report_files = [f for f in report_dir_files if os.path.basename(f) == "mlperf_storage_report.json"]
+
+                up_report_dir_files = os.listdir(os.path.dirname(report_dir))
+                up_report_files = [f for f in up_report_dir_files if os.path.basename(f) == "mlperf_storage_report.json"]
+
+                report_files.extend(up_report_files)
+
+                if len(report_files) > 1:
+                    print(f'Have more than 1 report files?: {summary} \n{report_files}')
+
+                if len(report_files) == 1:
+                    report_file = report_files[0]
+                    summary_report_map[sf] = report_file
+
+                if not report_files:
+                    summary_report_map[sf] = None
+
+            issue_details = {"all_reports_generated": {
+                "summaries_with_no_report": f"\n{31*' '}".join([sf for sf, report in summary_report_map.items() if report is None])
+            }}
+
+            non_issue_details = {"all_reports_generated": {
+                "summaries_with_reports": f"\n{34*' '}".join([sf for sf, report in summary_report_map.items() if report])
+            }}
+
+            if non_issue_details["all_reports_generated"]["summaries_with_reports"] and self.verbose:
+                self.add_issue_details(submitter=submitter,
+                                       issue_key="NON-ISSUE: All summaries have a generated report",
+                                       issue_details=non_issue_details)
+
+            if issue_details['all_reports_generated']['summaries_with_no_report']:
+                self.add_issue_details(submitter=submitter,
+                                       issue_key="ISSUE: Summaries_without_corresponding_report",
+                                       issue_details=issue_details)
 
     def check_dataset_size(self):
         NON_ISSUE_CORRECT = "NON-ISSUE: correct_dataset_size"
@@ -207,7 +254,7 @@ class MLPerfStorageResults:
                     with open(summary) as open_summary:
                         sum_data = json.load(open_summary)
 
-                    sum_config_dict = self.get_summary_config_dict(summary)
+                    sum_config_dict = self.get_summary_config_dict(summary=summary)
                     client_host_memory_in_gb = int(int(sum_data['host_meminfo']['MemTotal'].split()[0])/1024/1024)
 
                     run_dict = dict(
@@ -367,6 +414,9 @@ class MLPerfStorageResults:
                 inactive_file = []
                 AUs = []
                 for summary in summaries:
+                    if "code" in summary:
+                        continue
+
                     with open(summary) as open_summary:
                         sum_data = json.load(open_summary)
 
@@ -378,6 +428,9 @@ class MLPerfStorageResults:
                         AUs.append(round(sum_data['metric']['train_au_mean_percentage'], 2))
                     except Exception as e:
                         continue
+
+                if len(AUs) <= 1:
+                    print(f'Not checking for filesystem caching, code directory?: ')
 
                 # Convert to MiB
                 mem_total = [int(int(m.split(' ')[0])/1024) for m in mem_total]
