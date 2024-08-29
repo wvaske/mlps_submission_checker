@@ -7,7 +7,7 @@
 import argparse
 import json
 import os
-import sys
+import subprocess
 
 from datetime import datetime
 from statistics import mean, stdev
@@ -26,6 +26,8 @@ def parse_arguments():
     parser.add_argument('-r', '--root-path', required=True, type=str,
                         help="The root path of the submission directory. Top level directories in this path are "
                              "assumed to be the submitters")
+    parser.add_argument('-b', '--benchmark-script', default="/root/storage/",
+                        help="The directory containing 'benchmark.sh'. Used for the dataset sizing checks")
     parser.add_argument('-s', '--filter-submitters', nargs="+", default=[],
                         help="Space separated list of submitters to check")
     parser.add_argument('-a', '--check-all', action="store_true",
@@ -38,20 +40,39 @@ def parse_arguments():
                         help="Analyze the time between runs for possible non-consecutive tests.")
     parser.add_argument('--check-file-system-caching', action="store_true",
                         help="Analyze the cache percentages to detect possible issues.")
+    parser.add_argument('--check-checkpoint-files-in-code', action="store_true",
+                        help="Check for checkpoint files in code.")
+    parser.add_argument('--check-num-epochs', action="store_true",
+                        help="Verify that each run did 5 epochs")
+    parser.add_argument('--check-reports-exist', action="store_true",
+                        help="Verify the reportgen has been run for every run")
+    parser.add_argument('--check-dataset-size', action='store_true',
+                        help="Verify the dataset size was above the minimum requirement")
 
     return {k: v for k, v in vars(parser.parse_args()).items()}
+
+
+def get_datasize(benchmark_bin, workload, accelerator_type, num_accelerators, num_hosts, client_host_memory_in_gb):
+    cmd = f"{benchmark_bin} datasize -w {workload} -g {accelerator_type} -n {num_accelerators} -c {num_hosts}" \
+          f" -m {client_host_memory_in_gb}"
+    completed_command = subprocess.run(cmd, shell=True, capture_output=True)
+    output = completed_command.stdout.splitlines()
+    datasize_files = output[1].split()[1].decode()
+    return int(datasize_files)
 
 
 class MLPerfStorageResults:
 
     def __init__(self, root_path=None, verbose=False, check_all=False, reports_only=False, filter_submitters=None,
-                 *args, **kwargs):
+                 benchmark_script=None, *args, **kwargs):
 
         # Parameters need tob e set for check_init to work
         self.root_path = root_path
         self.verbose = verbose
         self.check_all = check_all
         self.reports_only = reports_only
+        self.benchmark_script_dir = benchmark_script
+        self.benchmark_script_bin = os.path.join(benchmark_script, "benchmark.sh")
 
         self.checks = {k: v for k, v in kwargs.items() if k.startswith("check_")}
         for key in self.checks.keys():
@@ -76,6 +97,7 @@ class MLPerfStorageResults:
         # The dicts hold <issue_type>: {<report path>:<detail_dict>}
         self.submitter_issues = {submitter: dict() for submitter in self.submitters}
 
+        self.submitter_file_list = []
         self.generate_run_mapping()
         self.run_checks()
         self.print_report()
@@ -106,6 +128,7 @@ class MLPerfStorageResults:
             submitter_file_list = get_file_list(submitter_dir)
             submitter_summaries = [f for f in submitter_file_list if os.path.basename(f) == "summary.json"]
             submitter_reports = [f for f in submitter_file_list if os.path.basename(f) == "mlperf_storage_report.json"]
+            self.submitter_file_list = submitter_file_list
 
             # For a given report, there should be a number of summary.json files that correspond with the same base path
             for report in submitter_reports:
@@ -113,10 +136,171 @@ class MLPerfStorageResults:
                 report_summaries = [f for f in submitter_summaries if f.startswith(report_base_path)]
                 self.submitter_report_summary_map[submitter][report] = report_summaries
 
+    def add_issue_details(self, submitter, issue_key, issue_details, report=None):
+        if issue_key not in self.submitter_issues[submitter].keys():
+            self.submitter_issues[submitter][issue_key] = dict()
+
+        if report:
+            if report not in self.submitter_issues[submitter][issue_key].keys():
+                self.submitter_issues[submitter][issue_key][report] = dict()
+
+            self.submitter_issues[submitter][issue_key][report].update(issue_details)
+
+        elif not report:
+            self.submitter_issues[submitter][issue_key].update(issue_details)
+
+    def get_summary_config_dict(self, summary):
+        # We are looking for a config.yaml and overrides.yaml that have the same basepath as the summary.json
+        base_dir = os.path.dirname(summary)
+        config_yaml = os.path.join(base_dir, "configs", "config.yaml")
+        overrides_yaml = os.path.join(base_dir, "configs", "overrides.yaml")
+
+        if not os.path.isfile(config_yaml):
+            print(f'Summary does not have associated config: {summary}')
+        if not os.path.isfile(overrides_yaml):
+            print(f"Summary does not have associated overrides: {summary}")
+
+        # We will start by reading the first line in overrides which should give us the info we need. We'll use other
+        # methods if necessary
+        with open(overrides_yaml) as open_overrides:
+            data = open_overrides.readlines()
+
+        if data[0].startswith("- workload="):
+            workload, accelerator = data[0].split("=")[1].strip().split('_')
+
+            return dict(workload=workload, accelerator=accelerator)
+
+        else:
+            print(f'Unable to determine workload and accelerator from overrides for summary: {summary}')
+
     def run_checks(self):
         for check, enabled in self.checks.items():
             if (self.check_all or enabled) and hasattr(self, check):
+                print(f'Running Check: {check}')
                 getattr(self, check)()
+
+    def check_reports_exist(self):
+        NON_ISSUE = "NON-ISSUE: reports_exist_for_all_summaries"
+        SUMMARIES_WITHOUT_REPORTS_ISSUE = "ISSUE: summaries_without_report"
+
+        # Whereever there is a summary file, there should be a report 1 level up
+        # We'll generate a flat list of the reports and summaries
+        # Then verify that summaries are matched to ../report
+        pass
+
+    def check_dataset_size(self):
+        NON_ISSUE_CORRECT = "NON-ISSUE: correct_dataset_size"
+        NON_ISSUE_LARGER = "NON-ISSUE: dataset_larger_than_necessary"
+        DATASET_TOO_SMALL_ISSUE = "ISSUE: dataset_too_small"
+
+        # We will need to be able to run the 'benchmark datasize' tool based on workload, accelerator model and count
+        # this will be fun
+        for submitter in self.submitters:
+            for report, summaries in self.submitter_report_summary_map[submitter].items():
+                datasize_minimums = []
+                num_files_trains = []
+                as_percents = []
+
+                for summary in summaries:
+                    if "code" in summary:
+                        continue
+                    with open(summary) as open_summary:
+                        sum_data = json.load(open_summary)
+
+                    sum_config_dict = self.get_summary_config_dict(summary)
+                    client_host_memory_in_gb = int(int(sum_data['host_meminfo']['MemTotal'].split()[0])/1024/1024)
+
+                    run_dict = dict(
+                        benchmark_bin=self.benchmark_script_bin,
+                        workload=sum_config_dict.get('workload'),
+                        accelerator_type=sum_config_dict.get('accelerator'),
+                        num_accelerators=sum_data['num_accelerators'],
+                        num_hosts=sum_data['num_hosts'],
+                        client_host_memory_in_gb=client_host_memory_in_gb
+                    )
+
+                    datasize_minimums.append(get_datasize(**run_dict))
+                    num_files_trains.append(sum_data['num_files_train'])
+                    as_percents.append(round((num_files_trains[-1] / datasize_minimums[-1])*100, 1))
+
+                issue_details = {report:
+
+                                     {
+                                         "workload": sum_config_dict.get('workload'),
+                                         'accelerator': sum_config_dict.get('accelerator'),
+                                         "num_accelerators": sum_data['num_accelerators'],
+                                         "num_hosts": sum_data['num_hosts'],
+                                         "client_host_memory_in_gb": client_host_memory_in_gb,
+                                         "datasize_minimums": datasize_minimums,
+                                         "num_files_train": num_files_trains,
+                                         "train_as_percent_of_requirement": as_percents}
+                                 }
+
+                if any([asp < 100 for asp in as_percents]):
+                    self.add_issue_details(submitter=submitter,
+                                           issue_key=DATASET_TOO_SMALL_ISSUE,
+                                           issue_details=issue_details)
+
+                elif all([100 <= asp <= 105 for asp in as_percents]) and self.verbose:
+                    self.add_issue_details(submitter=submitter,
+                                           issue_key=NON_ISSUE_CORRECT,
+                                           issue_details=issue_details)
+                elif any([asp > 105 for asp in as_percents]) and self.verbose:
+                    self.add_issue_details(submitter=submitter,
+                                           issue_key=NON_ISSUE_LARGER,
+                                           issue_details=issue_details)
+
+    def check_checkpoint_files_in_code(self):
+        NON_ISSUE = "NON-ISSUE: checkpoint_files_in_code"
+        CHECKPOINT_FILES_IN_CODE_ISSUE = "ISSUE: checkpoint_file_in_code"
+
+        for submitter in self.submitters:
+            submitter_files = get_file_list(os.path.join(self.root_path, submitter))
+            checkpoint_files = [f for f in submitter_files
+                                if os.path.basename(f).startswith("layer")
+                                and f.endswith(".pt")
+                                and "code" in f]
+
+            issue_details = {"No-specific-report": {"checkpoint_files": checkpoint_files}}
+            if checkpoint_files:
+                self.add_issue_details(submitter=submitter,
+                                       issue_key=CHECKPOINT_FILES_IN_CODE_ISSUE,
+                                       issue_details=issue_details)
+
+            elif self.verbose:
+                self.add_issue_details(submitter=submitter,
+                                       issue_key=NON_ISSUE,
+                                       issue_details=issue_details)
+
+    def check_num_epochs(self):
+        NON_ISSUE = "NON-ISSUE: runs_are_5_epochs"
+        WRONG_EPOCH_COUNT_ISSUE = "ISSUE: wrong_epoch_count"
+
+        for submitter in self.submitters:
+            for report, summaries in self.submitter_report_summary_map[submitter].items():
+                epochs = []
+                for summary in summaries:
+                    with open(summary) as open_summary:
+                        sum_data = json.load(open_summary)
+
+                    epochs.append(sum_data["epochs"])
+                    # print(epochs)
+
+                    # We can have multiple issues per report so we have 1 more key here than for other checks
+                issue_details = {report:
+                                     {"epochs": epochs
+                                      }
+                                 }
+
+                if all([e == 5 for e in epochs]) and self.verbose:
+                    self.add_issue_details(submitter=submitter,
+                                           issue_key=NON_ISSUE,
+                                           issue_details=issue_details)
+
+                if any([e != 5 for e in epochs]):
+                    self.add_issue_details(submitter=submitter,
+                                           issue_key=WRONG_EPOCH_COUNT_ISSUE,
+                                           issue_details=issue_details)
 
     def check_inter_test_times(self):
         NON_ISSUE = "NON-ISSUE: time_between_runs"
@@ -150,9 +334,6 @@ class MLPerfStorageResults:
                 for i in range(len(times) - 1):
                     deltas.append((times[i + 1][0] - times[i][1]).seconds)
 
-                if len(AUs) == 1:
-                    import pdb
-                    pdb.set_trace()
                 issue_details = {report:
                                      {"deltas": ", ".join([f"{delta}" for delta in deltas]),
                                       "run_times": ", ".join([f"{rt}" for rt in run_times]),
@@ -240,9 +421,19 @@ class MLPerfStorageResults:
                 for report, issue_detail in details.items():
                     print(f'    Report: {os.path.dirname(report)}')
                     if not self.reports_only:
-                        print(f'      Details:')
-                        for key, value in issue_detail.items():
-                            print(f'        {key}: {value}')
+                        if hasattr(list(issue_detail.values())[0], "keys"):
+                            # Go down one more layer
+
+                            for summary, summary_details in issue_detail.items():
+                                print(f'      Summary: {summary}:')
+                                for key, value in summary_details.items():
+                                    print(f'        {key}: {value}')
+
+                            print()
+                        else:
+                            print(f'      Details:')
+                            for key, value in issue_detail.items():
+                                print(f'        {key}: {value}')
                 print()
 
 
