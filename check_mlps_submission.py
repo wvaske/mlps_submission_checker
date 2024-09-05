@@ -30,6 +30,10 @@ def parse_arguments():
                         help="The directory containing 'benchmark.sh'. Used for the dataset sizing checks")
     parser.add_argument('-s', '--filter-submitters', nargs="+", default=[],
                         help="Space separated list of submitters to check")
+    parser.add_argument('-x', '--exclude-submitters', nargs="+", default=[],
+                        help="List of submitters to exclude")
+    parser.add_argument('-p', '--perf-reports', action="store_true",
+                        help="Print the performance report for each report")
     parser.add_argument('-a', '--check-all', action="store_true",
                         help="Perform all checks")
     parser.add_argument('--reports-only', action="store_true",
@@ -64,13 +68,14 @@ def get_datasize(benchmark_bin, workload, accelerator_type, num_accelerators, nu
 class MLPerfStorageResults:
 
     def __init__(self, root_path=None, verbose=False, check_all=False, reports_only=False, filter_submitters=None,
-                 benchmark_script=None, *args, **kwargs):
+                 benchmark_script=None, perf_reports=False, exclude_submitters=None, *args, **kwargs):
 
         # Parameters need tob e set for check_init to work
         self.root_path = root_path
         self.verbose = verbose
         self.check_all = check_all
         self.reports_only = reports_only
+        self.perf_reports = perf_reports
         self.benchmark_script_dir = benchmark_script
         self.benchmark_script_bin = os.path.join(benchmark_script, "benchmark.sh")
 
@@ -85,22 +90,33 @@ class MLPerfStorageResults:
         # Logic after knowing that init inputs are valid
         self.submitters = os.listdir(root_path)
         print(f'Processing {len(self.submitters)} submitters...')
-        non_submitter_dirs = ["CONTRIBUTING.md", ".github", "README.md", "LICENSE.md"]
+        non_submitter_dirs = ["CONTRIBUTING.md", ".github", "README.md", "LICENSE.md", ".DS_Store"]
         self.submitters = [s for s in self.submitters if s not in non_submitter_dirs]
 
         if filter_submitters:
             filter_submitters = [s.lower() for s in filter_submitters]
             self.submitters = [s for s in self.submitters if s.lower() in filter_submitters]
 
+        if exclude_submitters:
+            exclude_submitters = [s.lower() for s in exclude_submitters]
+            self.submitters = [s for s in self.submitters if s.lower() not in exclude_submitters]
+
         # The individual dicts hold "report_path":["list of summary.json paths"]
         self.submitter_report_summary_map = {submitter: dict() for submitter in self.submitters}
+        self.submitter_report_cgroup_map = {submitter: dict() for submitter in self.submitters}
+        self.submitter_performance_map = {submitter: dict() for submitter in self.submitters}
 
         # The dicts hold <issue_type>: {<report path>:<detail_dict>}
         self.submitter_issues = {submitter: dict() for submitter in self.submitters}
 
         self.submitter_file_list = dict()
+        self.checks_run = []
+
         self.generate_run_mapping()
         self.run_checks()
+
+        if self.perf_reports:
+            self.generate_performance_report()
         self.print_report()
 
     def validate_init(self):
@@ -131,6 +147,8 @@ class MLPerfStorageResults:
             submitter_file_list = get_file_list(submitter_dir)
             submitter_summaries = [f for f in submitter_file_list if os.path.basename(f) == "summary.json" if "code" not in f]
             submitter_reports = [f for f in submitter_file_list if os.path.basename(f) == "mlperf_storage_report.json" if "code" not in f]
+            submitter_cgroups = [f for f in submitter_file_list if os.path.basename(f) == "cgroups.json" if "code" not in f]
+
             self.submitter_file_list[submitter] = submitter_file_list
             num_summaries += len(submitter_summaries)
             num_reports += len(submitter_reports)
@@ -139,9 +157,59 @@ class MLPerfStorageResults:
             for report in submitter_reports:
                 report_base_path = os.path.dirname(report)
                 report_summaries = [f for f in submitter_summaries if f.startswith(report_base_path)]
+                report_cgroups = list()
+
+                report_path_up = report_base_path
+                while report_path_up:
+                    report_cgroups = [f for f in submitter_cgroups if f.startswith(report_path_up)]
+                    if report_cgroups:
+                        break
+                    else:
+                        report_path_up = os.path.dirname(report_path_up)
+
+                if len(report_cgroups) > 1:
+                    print(f'Have more than 1 cgroups.json file for a given report. '
+                          f'\n\tReport: {report}\n\t\t{report_cgroups}')
+
+                if report_cgroups:
+                    report_cgroups = report_cgroups[0]
+                else:
+                    report_cgroups = None
+
                 self.submitter_report_summary_map[submitter][report] = report_summaries
+                self.submitter_report_cgroup_map[submitter][report] = report_cgroups
 
         print(f'Processing {num_reports} Reports and {num_summaries} Summaries')
+
+    def generate_performance_report(self):
+        for submitter in self.submitters:
+            for report, summaries in self.submitter_report_summary_map[submitter].items():
+                report_result_dict = dict(
+                    au_list=list()
+                )
+                for summary in summaries:
+                    with open(summary, 'r') as summary_file:
+                        summary_dict = json.load(summary_file)
+
+                    try:
+                        report_result_dict["au_list"].append(round(summary_dict['metric']['train_au_mean_percentage'], 2))
+                    except Exception as e:
+                        import pdb
+                        pdb.set_trace()
+
+                report_result_dict['mean_au'] = mean([round(au, 2) for au in report_result_dict["au_list"]])
+
+                with open(report, 'r') as report_file:
+                    report_dict = json.load(report_file)
+
+                report_result_dict['workload'] = report_dict['overall']['model']
+                report_result_dict['accelerator'] = report_dict['overall']['accelerator']
+
+                for k, v in report_dict['overall'].items():
+                    if k.startswith("train_"):
+                        report_result_dict[k] = round(float(v), 2)
+
+                self.submitter_performance_map[submitter][report] = report_result_dict
 
     def add_issue_details(self, submitter, issue_key, issue_details, report=None):
         if issue_key not in self.submitter_issues[submitter].keys():
@@ -185,6 +253,7 @@ class MLPerfStorageResults:
         for check, enabled in self.checks.items():
             if (self.check_all or enabled) and hasattr(self, check):
                 print(f'Running Check: {check}')
+                self.checks_run.append(check)
                 getattr(self, check)()
 
     def check_reports_exist(self):
@@ -209,13 +278,20 @@ class MLPerfStorageResults:
                 report_dir_files = os.listdir(report_dir)
                 report_files = [f for f in report_dir_files if os.path.basename(f) == "mlperf_storage_report.json"]
 
-                up_report_dir_files = os.listdir(os.path.dirname(report_dir))
-                up_report_files = [f for f in up_report_dir_files if os.path.basename(f) == "mlperf_storage_report.json"]
+                if not report_files:
+                    up_report_dir = os.path.dirname(report_dir)
+                    up_report_dir_files = os.listdir(up_report_dir)
+                    up_report_files = [f for f in up_report_dir_files if os.path.basename(f) == "mlperf_storage_report.json"]
+                    report_files.extend(up_report_files)
 
-                report_files.extend(up_report_files)
+                    if not report_files:
+                        up_up_report_dir = os.path.dirname(up_report_dir)
+                        up_up_report_dir_files = os.listdir(up_up_report_dir)
+                        up_up_report_files = [f for f in up_up_report_dir_files if os.path.basename(f) == "mlperf_storage_report.json"]
+                        report_files.extend(up_up_report_files)
 
                 if len(report_files) > 1:
-                    print(f'Have more than 1 report files?: {summary} \n{report_files}')
+                    print(f'Have more than 1 report files?: {sf} \n{report_files}')
 
                 if len(report_files) == 1:
                     report_file = report_files[0]
@@ -250,10 +326,18 @@ class MLPerfStorageResults:
         # We will need to be able to run the 'benchmark datasize' tool based on workload, accelerator model and count
         # this will be fun
         for submitter in self.submitters:
+            print(f'Checking submitter dataset size: {submitter}')
             for report, summaries in self.submitter_report_summary_map[submitter].items():
                 datasize_minimums = []
                 num_files_trains = []
                 as_percents = []
+                cgroup_memory_in_gb = None
+
+                if cgroup_file := self.submitter_report_cgroup_map[submitter].get(report):
+                    with open(cgroup_file) as open_cgroup_file:
+                        cgroup_dict = json.load(open_cgroup_file)
+
+                    cgroup_memory_in_gb = int(int(cgroup_dict['mem_limit_bytes']/1024/1024/1024))
 
                 for summary in summaries:
                     if "code" in summary:
@@ -263,6 +347,9 @@ class MLPerfStorageResults:
 
                     sum_config_dict = self.get_summary_config_dict(summary=summary)
                     client_host_memory_in_gb = int(int(sum_data['host_meminfo']['MemTotal'].split()[0])/1024/1024)
+
+                    if cgroup_memory_in_gb:
+                        client_host_memory_in_gb = cgroup_memory_in_gb
 
                     run_dict = dict(
                         benchmark_bin=self.benchmark_script_bin,
@@ -358,7 +445,7 @@ class MLPerfStorageResults:
 
     def check_inter_test_times(self):
         NON_ISSUE = "NON-ISSUE: minimal_time_between_runs"
-        TIME_BETWEEN_RUNS_ISSUE = "ISSUE (possible): time_between_runs_exceeds_avg_runtime"
+        TIME_BETWEEN_RUNS_ISSUE = "NON-ISSUE: time_between_runs_exceeds_avg_runtime"
 
         for submitter in self.submitters:
             submitter_run_mapping = self.submitter_report_summary_map[submitter]
@@ -396,19 +483,20 @@ class MLPerfStorageResults:
                                       }
                                  }
 
-                if any(delta > mean_run_time for delta in deltas):
-                    if TIME_BETWEEN_RUNS_ISSUE not in self.submitter_issues[submitter].keys():
-                        self.submitter_issues[submitter][TIME_BETWEEN_RUNS_ISSUE] = dict()
-                    self.submitter_issues[submitter][TIME_BETWEEN_RUNS_ISSUE].update(issue_details)
+                if self.verbose:
+                    if any(delta > mean_run_time for delta in deltas):
+                        if TIME_BETWEEN_RUNS_ISSUE not in self.submitter_issues[submitter].keys():
+                            self.submitter_issues[submitter][TIME_BETWEEN_RUNS_ISSUE] = dict()
+                        self.submitter_issues[submitter][TIME_BETWEEN_RUNS_ISSUE].update(issue_details)
 
-                elif self.verbose:
-                    if NON_ISSUE not in self.submitter_issues[submitter].keys():
-                        self.submitter_issues[submitter][NON_ISSUE] = dict()
-                    self.submitter_issues[submitter][NON_ISSUE].update(issue_details)
+                    if all(delta < mean_run_time for delta in deltas):
+                        if NON_ISSUE not in self.submitter_issues[submitter].keys():
+                            self.submitter_issues[submitter][NON_ISSUE] = dict()
+                        self.submitter_issues[submitter][NON_ISSUE].update(issue_details)
 
     def check_file_system_caching(self):
         NON_ISSUE = 'NON-ISSUE: no_cached_runs'
-        SINGLE_CACHED_RUN_ISSUE = "ISSUE (possible): single_cached_run"
+        SINGLE_CACHED_RUN_ISSUE = "NON-ISSUE: single_cached_run"
         MULTIPLE_CACHED_RUNS_ISSUE = "ISSUE: multiple_cached_runs"
 
         for submitter in self.submitters:
@@ -449,21 +537,25 @@ class MLPerfStorageResults:
                 cached_percent = [round((active_file[i] + inactive_file[i]) / mem_total[i], 4) for i in range(len(mem_total))]
                 cached_runs = [cp for cp in cached_percent if cp > CACHE_PERCENT_THRESHOLD]
 
-                issue_details = {
-                        report: {
-                            "cached_percents": ", ".join([f"{round(cp*100, 2)}%" for cp in cached_percent]),
-                            "file_cache_size (MiB)": "; ".join([f"{fc:,}" for fc in file_cache]),
-                            "aus": ", ".join([f"{au}%" for au in AUs]),
-                            "au_std": round(stdev(AUs), 4)
+                try:
+                    issue_details = {
+                            report: {
+                                "cached_percents": ", ".join([f"{round(cp*100, 2)}%" for cp in cached_percent]),
+                                "file_cache_size (MiB)": "; ".join([f"{fc:,}" for fc in file_cache]),
+                                "aus": ", ".join([f"{au}%" for au in AUs]),
+                                "au_std": round(stdev(AUs), 4)
+                            }
                         }
-                    }
+                except Exception as e:
+                    import pdb
+                    pdb.set_trace()
 
                 if not cached_runs and self.verbose:
                     if NON_ISSUE not in self.submitter_issues[submitter].keys():
                         self.submitter_issues[submitter][NON_ISSUE] = dict()
                     self.submitter_issues[submitter][NON_ISSUE].update(issue_details)
 
-                if len(cached_runs) == 1:
+                if len(cached_runs) == 1 and self.verbose:
                     if SINGLE_CACHED_RUN_ISSUE not in self.submitter_issues[submitter].keys():
                         self.submitter_issues[submitter][SINGLE_CACHED_RUN_ISSUE] = dict()
                     self.submitter_issues[submitter][SINGLE_CACHED_RUN_ISSUE].update(issue_details)
@@ -474,26 +566,40 @@ class MLPerfStorageResults:
                     self.submitter_issues[submitter][MULTIPLE_CACHED_RUNS_ISSUE].update(issue_details)
 
     def print_report(self):
-        for submitter, issues in self.submitter_issues.items():
-            print(f'\nSubmitter: {submitter}')
-            for issue_type, details in issues.items():
-                print(f'  {issue_type}')
-                for report, issue_detail in details.items():
-                    print(f'    Report: {os.path.dirname(report)}')
-                    if not self.reports_only:
-                        if hasattr(list(issue_detail.values())[0], "keys"):
-                            # Go down one more layer
+        if self.checks_run:
+            for submitter, issues in self.submitter_issues.items():
+                print(f'\nSubmitter: {submitter}')
+                if not issues:
+                    print(f'  No issues found')
+                    continue
+                for issue_type, details in issues.items():
+                    print(f'  {issue_type}')
+                    for report, issue_detail in details.items():
+                        print(f'    Report: {os.path.dirname(report)}')
+                        if not self.reports_only:
+                            if hasattr(list(issue_detail.values())[0], "keys"):
+                                # Go down one more layer
 
-                            for summary, summary_details in issue_detail.items():
-                                print(f'      Summary: {summary}:')
-                                for key, value in summary_details.items():
+                                for summary, summary_details in issue_detail.items():
+                                    print(f'      Summary: {summary}:')
+                                    for key, value in summary_details.items():
+                                        print(f'        {key}: {value}')
+
+                                print()
+                            else:
+                                print(f'      Details:')
+                                for key, value in issue_detail.items():
                                     print(f'        {key}: {value}')
+                    print()
 
-                            print()
-                        else:
-                            print(f'      Details:')
-                            for key, value in issue_detail.items():
-                                print(f'        {key}: {value}')
+        if self.perf_reports:
+            for submitter, report_dict in self.submitter_performance_map.items():
+                print(f'\nSubmitter: {submitter}')
+                for report, report_details in report_dict.items():
+                    print(f'  Report: {report}')
+                    for k, v in report_details.items():
+                        print(f'    {k}: {v}')
+                    print()
                 print()
 
 
