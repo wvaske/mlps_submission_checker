@@ -34,6 +34,8 @@ def parse_arguments():
                         help="List of submitters to exclude")
     parser.add_argument('-p', '--perf-reports', action="store_true",
                         help="Print the performance report for each report")
+    parser.add_argument('-c', '--print-csv', action="store_true",
+                        help="Print CSV of performance data")
     parser.add_argument('-a', '--check-all', action="store_true",
                         help="Perform all checks")
     parser.add_argument('--reports-only', action="store_true",
@@ -68,7 +70,7 @@ def get_datasize(benchmark_bin, workload, accelerator_type, num_accelerators, nu
 class MLPerfStorageResults:
 
     def __init__(self, root_path=None, verbose=False, check_all=False, reports_only=False, filter_submitters=None,
-                 benchmark_script=None, perf_reports=False, exclude_submitters=None, *args, **kwargs):
+                 benchmark_script=None, perf_reports=False, exclude_submitters=None, print_csv=None, *args, **kwargs):
 
         # Parameters need tob e set for check_init to work
         self.root_path = root_path
@@ -76,6 +78,7 @@ class MLPerfStorageResults:
         self.check_all = check_all
         self.reports_only = reports_only
         self.perf_reports = perf_reports
+        self.print_csv = print_csv
         self.benchmark_script_dir = benchmark_script
         self.benchmark_script_bin = os.path.join(benchmark_script, "benchmark.sh")
 
@@ -115,8 +118,11 @@ class MLPerfStorageResults:
         self.generate_run_mapping()
         self.run_checks()
 
-        if self.perf_reports:
+        if self.perf_reports or self.print_csv:
             self.generate_performance_report()
+
+        if self.print_csv:
+            self.print_csv_data()
         self.print_report()
 
     def validate_init(self):
@@ -601,6 +607,35 @@ class MLPerfStorageResults:
                         print(f'    {k}: {v}')
                     print()
                 print()
+
+    def print_csv_data(self):
+        csv_data = []  # list of dictionaries
+        for submitter, report_dict in self.submitter_performance_map.items():
+            for report, report_details in report_dict.items():
+                tmp_dict = report_details.copy()
+                tmp_dict['report'] = os.path.dirname(report)
+                tmp_dict['submitter'] = submitter
+                del tmp_dict['au_list']
+                csv_data.append(tmp_dict)
+
+        import csv
+        all_fields = set()
+        for item in csv_data:
+            # import pdb
+            # pdb.set_trace()
+            all_fields.update(item.keys())
+
+        header_row = ""
+        for field in all_fields:
+            header_row += field + ","
+        print(header_row)
+
+        for item in csv_data:
+            str_to_print = ""
+            for field in all_fields:
+                str_to_print += str(item.get(field, "")) + ","
+
+            print(str_to_print)
 
 
 def get_file_list(top_directory="."):
